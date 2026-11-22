@@ -1,0 +1,459 @@
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from pathlib import Path
+from scipy.interpolate import griddata
+
+# =====================================================
+# 1. CONFIGURATION
+# =====================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+ORIGINAL_AP = (0.8, 0.8)  # Known synthetic AP position
+
+WEAK_THRESHOLD = -75.0    # Minimum acceptable RSSI
+GRID_SIZE = 80
+CANDIDATE_COUNT = 25
+
+# Avoid placing AP directly against room walls
+WALL_MARGIN = 0.25
+
+# =====================================================
+# 2. LOAD CLEANED DATA
+# =====================================================
+
+data_path = BASE_DIR / "cleaned_wifi_data.csv"
+
+if not data_path.exists():
+    raise FileNotFoundError(
+        f"Dataset not found: {data_path}"
+    )
+
+df = pd.read_csv(data_path)
+
+required_columns = ["x_m", "y_m", "rssi_mean"]
+
+for column in required_columns:
+    if column not in df.columns:
+        raise ValueError(f"Missing column: {column}")
+
+print("\n======================================")
+print("       COVERAGE-AI OPTIMIZATION")
+print("======================================")
+
+print("Measurements loaded:", len(df))
+print("Original AP position:", ORIGINAL_AP)
+
+# =====================================================
+# 3. DEFINE ROOM AND PREDICTION GRID
+# =====================================================
+
+x_min = df["x_m"].min()
+x_max = df["x_m"].max()
+
+y_min = df["y_m"].min()
+y_max = df["y_m"].max()
+
+x_values = np.linspace(x_min, x_max, GRID_SIZE)
+y_values = np.linspace(y_min, y_max, GRID_SIZE)
+
+XX, YY = np.meshgrid(x_values, y_values)
+
+# =====================================================
+# 4. CALIBRATE PROPAGATION MODEL
+# =====================================================
+
+ap_x, ap_y = ORIGINAL_AP
+
+# Distance from original AP to every measurement
+distances = np.sqrt(
+    (df["x_m"].to_numpy() - ap_x) ** 2
+    +
+    (df["y_m"].to_numpy() - ap_y) ** 2
+)
+
+distances = np.maximum(distances, 0.25)
+
+rssi_values = df["rssi_mean"].to_numpy()
+
+# Fit log-distance propagation model
+log_distances = np.log10(distances)
+
+slope, intercept = np.polyfit(
+    log_distances,
+    rssi_values,
+    1
+)
+
+# Ensure physically decreasing signal with distance
+path_loss_exponent = max(-slope / 10, 1.0)
+
+slope = -10 * path_loss_exponent
+
+print("\nCalibrated path-loss exponent:",
+      round(path_loss_exponent, 3))
+
+# Calculate spatial residuals
+fitted_values = intercept + slope * log_distances
+
+residuals = rssi_values - fitted_values
+
+# Interpolate residual attenuation over room
+residual_map = griddata(
+    (df["x_m"], df["y_m"]),
+    residuals,
+    (XX, YY),
+    method="linear"
+)
+
+# Fill missing edge values using nearest measurements
+nearest_map = griddata(
+    (df["x_m"], df["y_m"]),
+    residuals,
+    (XX, YY),
+    method="nearest"
+)
+
+residual_map = np.where(
+    np.isnan(residual_map),
+    nearest_map,
+    residual_map
+)
+
+# =====================================================
+# 5. AP SIMULATION FUNCTION
+# =====================================================
+
+def simulate_ap(position):
+
+    candidate_x, candidate_y = position
+
+    distance = np.sqrt(
+        (XX - candidate_x) ** 2
+        +
+        (YY - candidate_y) ** 2
+    )
+
+    distance = np.maximum(distance, 0.25)
+
+    # Estimated RSSI for candidate AP
+    predicted_rssi = (
+        intercept
+        +
+        slope * np.log10(distance)
+        +
+        residual_map
+    )
+
+    return predicted_rssi
+
+
+# =====================================================
+# 6. ORIGINAL AP PERFORMANCE
+# =====================================================
+
+original_map = simulate_ap(ORIGINAL_AP)
+
+original_mean = np.mean(original_map)
+
+original_p10 = np.percentile(
+    original_map, 10
+)
+
+original_coverage = np.mean(
+    original_map >= WEAK_THRESHOLD
+) * 100
+
+# Optimization score
+# Higher (less negative) is better.
+original_score = (
+    0.50 * original_mean
+    +
+    0.50 * original_p10
+)
+
+print("\n========== ORIGINAL AP ==========")
+
+print("Position:", ORIGINAL_AP)
+print("Mean RSSI:", round(original_mean, 2), "dBm")
+print("10th percentile:", round(original_p10, 2), "dBm")
+print("Coverage:", round(original_coverage, 2), "%")
+print("Optimization score:", round(original_score, 2))
+
+# =====================================================
+# 7. GENERATE CANDIDATE AP POSITIONS
+# =====================================================
+
+candidate_x_values = np.linspace(
+    x_min + WALL_MARGIN,
+    x_max - WALL_MARGIN,
+    CANDIDATE_COUNT
+)
+
+candidate_y_values = np.linspace(
+    y_min + WALL_MARGIN,
+    y_max - WALL_MARGIN,
+    CANDIDATE_COUNT
+)
+
+results = []
+
+print("\nEvaluating AP positions...")
+
+for cx in candidate_x_values:
+
+    for cy in candidate_y_values:
+
+        candidate_map = simulate_ap((cx, cy))
+
+        mean_rssi = np.mean(candidate_map)
+
+        p10_rssi = np.percentile(
+            candidate_map, 10
+        )
+
+        coverage = np.mean(
+            candidate_map >= WEAK_THRESHOLD
+        ) * 100
+
+        # Reward strong average and weak-zone performance
+        score = (
+            0.50 * mean_rssi
+            +
+            0.50 * p10_rssi
+        )
+
+        results.append({
+            "ap_x": cx,
+            "ap_y": cy,
+            "mean_rssi": mean_rssi,
+            "p10_rssi": p10_rssi,
+            "coverage_percentage": coverage,
+            "optimization_score": score
+        })
+
+# Always include exact original position
+results.append({
+    "ap_x": ap_x,
+    "ap_y": ap_y,
+    "mean_rssi": original_mean,
+    "p10_rssi": original_p10,
+    "coverage_percentage": original_coverage,
+    "optimization_score": original_score
+})
+
+results_df = pd.DataFrame(results)
+
+# =====================================================
+# 8. SELECT BEST AP POSITION
+# =====================================================
+
+# Highest score first.
+# If scores tie, prefer higher coverage.
+# If still tied, prefer the original AP.
+results_df["distance_from_original"] = np.sqrt(
+    (results_df["ap_x"] - ap_x) ** 2
+    +
+    (results_df["ap_y"] - ap_y) ** 2
+)
+
+results_df = results_df.sort_values(
+    by=[
+        "optimization_score",
+        "coverage_percentage",
+        "distance_from_original"
+    ],
+    ascending=[False, False, True]
+)
+
+best = results_df.iloc[0]
+
+best_x = best["ap_x"]
+best_y = best["ap_y"]
+
+best_mean = best["mean_rssi"]
+best_p10 = best["p10_rssi"]
+best_coverage = best["coverage_percentage"]
+best_score = best["optimization_score"]
+
+# =====================================================
+# 9. COMPARE ORIGINAL AND OPTIMIZED PLACEMENT
+# =====================================================
+
+print("\n========== OPTIMIZATION RESULTS ==========")
+
+print(
+    "\nOriginal AP position:",
+    (round(ap_x, 2), round(ap_y, 2))
+)
+
+print(
+    "Recommended AP position:",
+    (round(best_x, 2), round(best_y, 2))
+)
+
+print("\nORIGINAL PERFORMANCE")
+print("Mean RSSI:", round(original_mean, 2), "dBm")
+print("10th percentile:", round(original_p10, 2), "dBm")
+print("Coverage:", round(original_coverage, 2), "%")
+
+print("\nRECOMMENDED PERFORMANCE")
+print("Mean RSSI:", round(best_mean, 2), "dBm")
+print("10th percentile:", round(best_p10, 2), "dBm")
+print("Coverage:", round(best_coverage, 2), "%")
+
+print("\nIMPROVEMENT")
+print("Mean RSSI improvement:",
+      round(best_mean - original_mean, 2), "dB")
+
+print("Weak-zone improvement:",
+      round(best_p10 - original_p10, 2), "dB")
+
+print("Coverage improvement:",
+      round(best_coverage - original_coverage, 2),
+      "percentage points")
+
+print("Score improvement:",
+      round(best_score - original_score, 3))
+
+if best_score <= original_score + 1e-9:
+    print("\nOriginal AP is the best evaluated position.")
+else:
+    print("\nA better candidate was identified.")
+
+# =====================================================
+# 10. DETECT WEAK ZONES
+# =====================================================
+
+weak_mask = original_map < WEAK_THRESHOLD
+
+weak_zones = pd.DataFrame({
+    "x_m": XX[weak_mask],
+    "y_m": YY[weak_mask],
+    "predicted_rssi": original_map[weak_mask]
+})
+
+weak_zones.to_csv(
+    BASE_DIR / "weak_zones.csv",
+    index=False
+)
+
+print("\n========== WEAK ZONE ANALYSIS ==========")
+
+print("Weak locations:", len(weak_zones))
+print("Total grid locations:", GRID_SIZE * GRID_SIZE)
+
+print(
+    "Weak area percentage:",
+    round(len(weak_zones) / (GRID_SIZE * GRID_SIZE) * 100, 2),
+    "%"
+)
+
+# =====================================================
+# 11. SAVE CANDIDATE RESULTS
+# =====================================================
+
+results_df.to_csv(
+    BASE_DIR / "ap_placement_candidates.csv",
+    index=False
+)
+
+summary = pd.DataFrame([{
+    "original_ap_x": ap_x,
+    "original_ap_y": ap_y,
+    "recommended_ap_x": best_x,
+    "recommended_ap_y": best_y,
+    "original_mean_rssi": original_mean,
+    "optimized_mean_rssi": best_mean,
+    "original_p10_rssi": original_p10,
+    "optimized_p10_rssi": best_p10,
+    "original_coverage": original_coverage,
+    "optimized_coverage": best_coverage,
+    "optimization_score": best_score
+}])
+
+summary.to_csv(
+    BASE_DIR / "coverage_optimization_summary.csv",
+    index=False
+)
+
+# =====================================================
+# 12. FINAL VISUALIZATION
+# =====================================================
+
+plt.figure(figsize=(11, 7))
+
+plt.imshow(
+    original_map,
+    extent=[
+        x_min, x_max,
+        y_min, y_max
+    ],
+    origin="lower",
+    aspect="auto",
+    cmap="RdYlGn",
+    vmin=-80,
+    vmax=-30
+)
+
+plt.colorbar(
+    label="Estimated RSSI (dBm)"
+)
+
+# Weak zones
+if len(weak_zones) > 0:
+
+    plt.scatter(
+        weak_zones["x_m"],
+        weak_zones["y_m"],
+        color="blue",
+        s=8,
+        label="Weak coverage"
+    )
+
+# Original AP
+plt.scatter(
+    ap_x,
+    ap_y,
+    marker="s",
+    color="white",
+    edgecolors="black",
+    s=170,
+    label="Original AP"
+)
+
+# Recommended AP
+plt.scatter(
+    best_x,
+    best_y,
+    marker="*",
+    color="cyan",
+    edgecolors="black",
+    s=350,
+    label="Recommended AP"
+)
+
+plt.xlabel("X Coordinate (m)")
+plt.ylabel("Y Coordinate (m)")
+
+plt.title(
+    "COVERAGE-AI - AP Placement Optimization\n"
+    f"Mean RSSI: {original_mean:.1f} → {best_mean:.1f} dBm"
+)
+
+plt.legend()
+plt.tight_layout()
+
+plt.savefig(
+    BASE_DIR / "final_coverage_optimization.png",
+    dpi=300
+)
+
+plt.show()
+
+print("\n======================================")
+print("COVERAGE-AI OPTIMIZATION COMPLETED")
+print("======================================")

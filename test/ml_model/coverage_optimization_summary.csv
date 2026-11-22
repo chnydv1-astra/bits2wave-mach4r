@@ -1,0 +1,2 @@
+original_ap_x,original_ap_y,recommended_ap_x,recommended_ap_y,original_mean_rssi,optimized_mean_rssi,original_p10_rssi,optimized_p10_rssi,original_coverage,optimized_coverage,optimization_score
+0.8,0.8,4.583333333333334,3.0,-51.80302183059065,-45.708079164392736,-63.38472846894067,-52.97035358446502,100.0,100.0,-49.33921637442888

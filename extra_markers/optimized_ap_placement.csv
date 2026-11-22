@@ -1,0 +1,2 @@
+existing_ap_x,existing_ap_y,recommended_ap_x,recommended_ap_y,target_rssi,coverage_before_percent,coverage_after_percent,coverage_improvement_percent,path_loss_exponent,calibration_mae_db
+0.75,1.4,0.7500000000000002,0.45000000000000007,-67.0,100.0,100.0,0.0,2.3368774826242777,3.5685840947495393

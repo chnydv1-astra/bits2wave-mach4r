@@ -1,0 +1,589 @@
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+from pathlib import Path
+from sklearn.linear_model import HuberRegressor
+
+# =====================================================
+# 1. CONFIGURATION
+# =====================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+PREDICTION_FILE = BASE_DIR / "coverage_ai_predictions.csv"
+MEASUREMENTS_FILE = BASE_DIR / "coverage_ai_fused.csv"
+
+OUTPUT_FILE = BASE_DIR / "optimized_ap_placement.csv"
+SCAN_FILE = BASE_DIR / "ap_candidate_evaluation.csv"
+OUTPUT_IMAGE = BASE_DIR / "coverage_ai_optimized_ap.png"
+
+ARENA_SIZE = 1.5
+
+# Existing Airtel router coordinates
+EXISTING_AP_X = 0.75
+EXISTING_AP_Y = 1.4
+
+# Coverage requirements
+TARGET_RSSI = -67.0
+
+# Candidate placement constraints
+EDGE_MARGIN = 0.10
+MIN_DISTANCE_FROM_EXISTING_AP = 0.30
+
+# Assume new AP has same effective transmit power
+# and antenna characteristics as existing AP.
+MIN_MODEL_DISTANCE = 0.10
+
+# Candidate search resolution
+CANDIDATE_STEP = 0.05
+
+# =====================================================
+# 2. START
+# =====================================================
+
+print("\n" + "=" * 60)
+print("       COVERAGE-AI AP PLACEMENT OPTIMIZER")
+print("=" * 60)
+
+# =====================================================
+# 3. LOAD DATA
+# =====================================================
+
+print("\n[1/8] Loading measurements and AI predictions...")
+
+if not PREDICTION_FILE.exists():
+    raise FileNotFoundError(PREDICTION_FILE)
+
+if not MEASUREMENTS_FILE.exists():
+    raise FileNotFoundError(MEASUREMENTS_FILE)
+
+pred_df = pd.read_csv(PREDICTION_FILE)
+meas_df = pd.read_csv(MEASUREMENTS_FILE)
+
+for col in ["x", "y", "predicted_rssi"]:
+    if col not in pred_df.columns:
+        raise ValueError(f"Missing prediction column: {col}")
+
+for col in ["x", "y", "rssi"]:
+    if col not in meas_df.columns:
+        raise ValueError(f"Missing measurement column: {col}")
+
+for col in ["x", "y", "predicted_rssi"]:
+    pred_df[col] = pd.to_numeric(
+        pred_df[col], errors="coerce"
+    )
+
+for col in ["x", "y", "rssi"]:
+    meas_df[col] = pd.to_numeric(
+        meas_df[col], errors="coerce"
+    )
+
+pred_df = pred_df.dropna(
+    subset=["x", "y", "predicted_rssi"]
+)
+
+meas_df = meas_df.dropna(
+    subset=["x", "y", "rssi"]
+)
+
+meas_df = meas_df[
+    meas_df["rssi"].between(-100, 0)
+].copy()
+
+if len(meas_df) < 10:
+    raise ValueError("Not enough RSSI measurements.")
+
+# =====================================================
+# 4. PREPARE EXISTING COVERAGE GRID
+# =====================================================
+
+print("\n[2/8] Preparing existing AP coverage...")
+
+x_values = np.sort(pred_df["x"].unique())
+y_values = np.sort(pred_df["y"].unique())
+
+existing_grid = (
+    pred_df.pivot(
+        index="y",
+        columns="x",
+        values="predicted_rssi"
+    )
+    .reindex(
+        index=y_values,
+        columns=x_values
+    )
+    .to_numpy()
+)
+
+if not np.isfinite(existing_grid).all():
+    raise ValueError("Invalid prediction grid.")
+
+grid_x, grid_y = np.meshgrid(
+    x_values,
+    y_values
+)
+
+points = np.column_stack([
+    grid_x.ravel(),
+    grid_y.ravel()
+])
+
+existing_flat = existing_grid.ravel()
+
+
+# =====================================================
+# 5. CALIBRATE PATH-LOSS MODEL (ROBUST VERSION)
+# =====================================================
+
+print("\n[3/8] Calibrating wireless propagation model...")
+
+from scipy.optimize import least_squares
+
+# Distance from each measurement to existing router
+
+distances = np.sqrt(
+    (meas_df["x"].values - EXISTING_AP_X) ** 2
+    +
+    (meas_df["y"].values - EXISTING_AP_Y) ** 2
+)
+
+distances = np.maximum(
+    distances,
+    MIN_MODEL_DISTANCE
+)
+
+log_distances = np.log10(distances)
+
+observed_rssi = meas_df["rssi"].values
+
+# RSSI = intercept + slope * log10(distance)
+
+# Constrain slope to negative values.
+# This represents a physically decreasing signal
+# with increasing distance.
+
+def residuals(params):
+    intercept, slope = params
+
+    predicted = (
+        intercept + slope * log_distances
+    )
+
+    return predicted - observed_rssi
+
+
+initial_intercept = float(np.median(observed_rssi))
+
+fit = least_squares(
+    residuals,
+    x0=[initial_intercept, -20.0],
+    bounds=(
+        [-150, -60],
+        [50, -10]
+    ),
+    loss="soft_l1",
+    f_scale=3.0,
+    max_nfev=5000
+)
+
+intercept = float(fit.x[0])
+slope = float(fit.x[1])
+
+path_loss_exponent = -slope / 10.0
+
+fitted_rssi = (
+    intercept + slope * log_distances
+)
+
+calibration_mae = float(
+    np.mean(
+        np.abs(observed_rssi - fitted_rssi)
+    )
+)
+
+print("\n========== PATH LOSS MODEL ==========")
+
+print("Intercept:", round(intercept, 2), "dBm")
+
+print(
+    "Path loss exponent:",
+    round(path_loss_exponent, 3)
+)
+
+print(
+    "Calibration MAE:",
+    round(calibration_mae, 2),
+    "dB"
+)
+
+# Detect potentially unreliable calibration
+
+if slope <= -59 or slope >= -10.5:
+
+    print("\nWARNING:")
+    print("Path-loss fit reached a slope boundary.")
+    print("The measurements may not support reliable")
+    print("distance-based propagation calibration.")
+
+if calibration_mae > 8:
+
+    print("\nWARNING:")
+    print("High calibration error detected.")
+    print("Treat AP placement results as exploratory.")
+
+
+# =====================================================
+# 6. BASELINE COVERAGE
+# =====================================================
+
+print("\n[4/8] Calculating existing coverage...")
+
+before_coverage = np.mean(
+    existing_flat >= TARGET_RSSI
+) * 100
+
+before_weak = 100 - before_coverage
+
+print("Existing AP:", EXISTING_AP_X, EXISTING_AP_Y)
+
+print("Coverage before:", round(before_coverage, 2), "%")
+
+print("Weak coverage before:", round(before_weak, 2), "%")
+
+# =====================================================
+# 7. GENERATE CANDIDATE LOCATIONS
+# =====================================================
+
+print("\n[5/8] Generating AP candidate locations...")
+
+candidate_coordinates = np.arange(
+    EDGE_MARGIN,
+    ARENA_SIZE - EDGE_MARGIN + 0.0001,
+    CANDIDATE_STEP
+)
+
+candidate_results = []
+
+for candidate_x in candidate_coordinates:
+
+    for candidate_y in candidate_coordinates:
+
+        # Avoid placing new AP too close to existing AP
+
+        separation = np.sqrt(
+            (candidate_x - EXISTING_AP_X) ** 2
+            +
+            (candidate_y - EXISTING_AP_Y) ** 2
+        )
+
+        if separation < MIN_DISTANCE_FROM_EXISTING_AP:
+            continue
+
+        # Distance from candidate AP to every grid point
+
+        candidate_distances = np.sqrt(
+            (points[:, 0] - candidate_x) ** 2
+            +
+            (points[:, 1] - candidate_y) ** 2
+        )
+
+        candidate_distances = np.maximum(
+            candidate_distances,
+            MIN_MODEL_DISTANCE
+        )
+
+        # Predicted RSSI from additional AP
+
+        new_ap_rssi = (
+            intercept
+            +
+            slope * np.log10(candidate_distances)
+        )
+
+        # Strongest available AP signal
+        # RSSI in dBm is not directly added.
+        # The client is assumed to use the stronger signal.
+
+        combined_rssi = np.maximum(
+            existing_flat,
+            new_ap_rssi
+        )
+
+        coverage_after = np.mean(
+            combined_rssi >= TARGET_RSSI
+        ) * 100
+
+        improvement = (
+            coverage_after - before_coverage
+        )
+
+        # Average RSSI is a secondary tie-break metric.
+        # Primary objective is threshold coverage.
+
+        candidate_results.append({
+
+            "ap_x": candidate_x,
+            "ap_y": candidate_y,
+
+            "distance_from_existing_ap": separation,
+
+            "coverage_before_percent": before_coverage,
+
+            "coverage_after_percent": coverage_after,
+
+            "coverage_improvement_percent": improvement,
+
+            "average_rssi_after": np.mean(combined_rssi),
+
+            "weak_points_after": int(
+                np.sum(combined_rssi < TARGET_RSSI)
+            )
+
+        })
+
+results_df = pd.DataFrame(candidate_results)
+
+if results_df.empty:
+    raise ValueError("No valid AP candidate locations.")
+
+# =====================================================
+# 8. RANK CANDIDATES
+# =====================================================
+
+print("\n[6/8] Ranking AP placements...")
+
+results_df = results_df.sort_values(
+    by=[
+        "coverage_after_percent",
+        "average_rssi_after"
+    ],
+    ascending=False
+).reset_index(drop=True)
+
+results_df.insert(
+    0,
+    "rank",
+    np.arange(1, len(results_df) + 1)
+)
+
+best = results_df.iloc[0]
+
+best_x = float(best["ap_x"])
+best_y = float(best["ap_y"])
+
+# Recalculate best combined coverage map
+
+best_distances = np.sqrt(
+    (points[:, 0] - best_x) ** 2
+    +
+    (points[:, 1] - best_y) ** 2
+)
+
+best_distances = np.maximum(
+    best_distances,
+    MIN_MODEL_DISTANCE
+)
+
+best_new_ap_rssi = (
+    intercept
+    +
+    slope * np.log10(best_distances)
+)
+
+combined_grid = np.maximum(
+    existing_flat,
+    best_new_ap_rssi
+).reshape(existing_grid.shape)
+
+# =====================================================
+# 9. SAVE RESULTS
+# =====================================================
+
+print("\n[7/8] Saving optimization results...")
+
+results_df.to_csv(
+    SCAN_FILE,
+    index=False
+)
+
+pd.DataFrame([{
+    "existing_ap_x": EXISTING_AP_X,
+    "existing_ap_y": EXISTING_AP_Y,
+    "recommended_ap_x": best_x,
+    "recommended_ap_y": best_y,
+    "target_rssi": TARGET_RSSI,
+    "coverage_before_percent": before_coverage,
+    "coverage_after_percent": best["coverage_after_percent"],
+    "coverage_improvement_percent": best["coverage_improvement_percent"],
+    "path_loss_exponent": path_loss_exponent,
+    "calibration_mae_db": calibration_mae
+}]).to_csv(
+    OUTPUT_FILE,
+    index=False
+)
+
+# =====================================================
+# 10. VISUALIZE BEFORE AND AFTER
+# =====================================================
+
+print("\n[8/8] Generating optimization comparison...")
+
+fig, axes = plt.subplots(
+    1, 2,
+    figsize=(15, 7)
+)
+
+extent = [
+    x_values.min(),
+    x_values.max(),
+    y_values.min(),
+    y_values.max()
+]
+
+# BEFORE
+im1 = axes[0].imshow(
+    existing_grid,
+    extent=extent,
+    origin="lower",
+    cmap="RdYlGn",
+    vmin=-80,
+    vmax=-30,
+    interpolation="nearest",
+    aspect="equal"
+)
+
+axes[0].scatter(
+    EXISTING_AP_X,
+    EXISTING_AP_Y,
+    marker="D",
+    s=150,
+    color="blue",
+    edgecolors="white",
+    label="Existing Airtel AP",
+    zorder=5
+)
+
+axes[0].set_title(
+    f"BEFORE ADDITIONAL AP\nCoverage: {before_coverage:.1f}%"
+)
+
+# AFTER
+im2 = axes[1].imshow(
+    combined_grid,
+    extent=extent,
+    origin="lower",
+    cmap="RdYlGn",
+    vmin=-80,
+    vmax=-30,
+    interpolation="nearest",
+    aspect="equal"
+)
+
+axes[1].scatter(
+    EXISTING_AP_X,
+    EXISTING_AP_Y,
+    marker="D",
+    s=150,
+    color="blue",
+    edgecolors="white",
+    label="Existing Airtel AP",
+    zorder=5
+)
+
+axes[1].scatter(
+    best_x,
+    best_y,
+    marker="*",
+    s=500,
+    color="magenta",
+    edgecolors="white",
+    linewidths=1.5,
+    label="Recommended Additional AP",
+    zorder=6
+)
+
+axes[1].set_title(
+    f"AFTER ADDITIONAL AP\n"
+    f"Coverage: {best['coverage_after_percent']:.1f}%"
+)
+
+for ax in axes:
+
+    ax.set_xlim(0, ARENA_SIZE)
+    ax.set_ylim(0, ARENA_SIZE)
+
+    ax.set_xlabel("X Position (metres)")
+    ax.set_ylabel("Y Position (metres)")
+
+    ax.legend(loc="upper right")
+    ax.grid(alpha=0.2)
+
+fig.colorbar(
+    im2,
+    ax=axes,
+    label="Predicted RSSI (dBm)",
+    shrink=0.85
+)
+
+fig.suptitle(
+    "COVERAGE-AI | OPTIMIZED ACCESS POINT PLACEMENT",
+    fontsize=15,
+    fontweight="bold"
+)
+
+plt.tight_layout()
+
+plt.savefig(
+    OUTPUT_IMAGE,
+    dpi=300,
+    bbox_inches="tight"
+)
+
+plt.show()
+
+# =====================================================
+# 11. FINAL REPORT
+# =====================================================
+
+print("\n")
+print("=" * 60)
+print("       OPTIMIZATION RESULTS")
+print("=" * 60)
+
+print("\nEXISTING ACCESS POINT")
+print(f"X = {EXISTING_AP_X:.3f} m")
+print(f"Y = {EXISTING_AP_Y:.3f} m")
+
+print("\nRECOMMENDED ADDITIONAL ACCESS POINT")
+
+print(f"X = {best_x:.3f} m")
+print(f"Y = {best_y:.3f} m")
+
+print("\nCOVERAGE COMPARISON")
+
+print(f"Before: {before_coverage:.2f}%")
+
+print(
+    f"After: {best['coverage_after_percent']:.2f}%"
+)
+
+print(
+    f"Improvement: "
+    f"{best['coverage_improvement_percent']:.2f} percentage points"
+)
+
+print("\nPATH-LOSS CALIBRATION")
+
+print(f"Exponent: {path_loss_exponent:.3f}")
+
+print(f"Calibration MAE: {calibration_mae:.2f} dB")
+
+print("\nGENERATED FILES")
+
+print(OUTPUT_FILE)
+print(SCAN_FILE)
+print(OUTPUT_IMAGE)
+
+print("\nOPTIMIZATION COMPLETED!")
